@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+  # 主要训练服务
+  glacier-pinns-training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: glacier-pinns-training
+    volumes:
+      - ./data_management:/app/data_management
+      - ./experiments:/app/experiments
+      - ./model_architecture:/app/model_architecture
+      - ./training_framework:/app/training_framework
+      - ./validation_testing:/app/validation_testing
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
+      - PYTHONPATH=/app
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - glacier-network
+    command: python main_experiment.py
+
+  # Jupyter开发环境
+  glacier-jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    container_name: glacier-jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/app
+      - ./data_management:/app/data_management
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - PYTHONPATH=/app
+    networks:
+      - glacier-network
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+
+  # 可视化服务
+  glacier-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: glacier-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./analysis_visualization:/app/analysis_visualization
+      - ./experiments/results:/app/results
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - glacier-network
+    depends_on:
+      - glacier-pinns-training
+    command: streamlit run analysis_visualization/interactive_visualization/web_dashboard.py
+
+  # API服务
+  glacier-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: glacier-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./deployment_application:/app/deployment_application
+      - ./experiments/checkpoints:/app/checkpoints
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - glacier-network
+    depends_on:
+      - glacier-pinns-training
+    command: uvicorn deployment_application.model_deployment.api_service:app --host 0.0.0.0 --port 8000
+
+  # 数据库服务（用于存储实验结果）
+  postgres:
+    image: postgres:13
+    container_name: glacier-postgres
+    environment:
+      - POSTGRES_DB=glacier_experiments
+      - POSTGRES_USER=glacier_user
+      - POSTGRES_PASSWORD=glacier_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - glacier-network
+
+  # Redis缓存服务
+  redis:
+    image: redis:6-alpine
+    container_name: glacier-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - glacier-network
+
+  # 监控服务
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: glacier-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - glacier-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: glacier-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - glacier-network
+    depends_on:
+      - prometheus
+
+networks:
+  glacier-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
