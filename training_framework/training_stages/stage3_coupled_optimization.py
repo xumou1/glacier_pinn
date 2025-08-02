@@ -1,966 +1,1052 @@
 #!/usr/bin/env python3
 """
-阶段3：耦合优化模块
+阶段3：耦合优化训练
 
-实现PINNs模型的耦合优化阶段，包括多物理场耦合、
-多尺度优化和自适应权重调整。
+实现多目标耦合优化的训练阶段，包括：
+- 多目标优化策略
+- 约束耦合处理
+- 自适应权重调整
+- 收敛性分析
+
+Author: Tibetan Glacier PINNs Project Team
+Date: 2025
 """
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-from flax.training import train_state
-import optax
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from abc import ABC, abstractmethod
+import logging
+from dataclasses import dataclass
+from enum import Enum
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from sklearn.preprocessing import StandardScaler
+import warnings
 
-class CoupledOptimizationStage(ABC):
-    """
-    耦合优化阶段基类
+class OptimizationType(Enum):
+    """优化类型枚举"""
+    PARETO = "pareto"  # 帕累托优化
+    WEIGHTED_SUM = "weighted_sum"  # 加权和
+    CONSTRAINT = "constraint"  # 约束优化
+    LEXICOGRAPHIC = "lexicographic"  # 字典序优化
+    GOAL_PROGRAMMING = "goal_programming"  # 目标规划
+    EVOLUTIONARY = "evolutionary"  # 进化算法
+
+class ConstraintType(Enum):
+    """约束类型枚举"""
+    EQUALITY = "equality"  # 等式约束
+    INEQUALITY = "inequality"  # 不等式约束
+    BOUND = "bound"  # 边界约束
+    PHYSICS = "physics"  # 物理约束
+    DATA = "data"  # 数据约束
+    TEMPORAL = "temporal"  # 时间约束
+    SPATIAL = "spatial"  # 空间约束
+
+@dataclass
+class CoupledOptimizationConfig:
+    """耦合优化配置"""
+    optimization_type: OptimizationType = OptimizationType.WEIGHTED_SUM
+    max_iterations: int = 1000
+    tolerance: float = 1e-6
+    constraint_penalty: float = 1.0
+    weight_adaptation_rate: float = 0.01
+    pareto_population_size: int = 50
+    convergence_window: int = 10
+    objective_weights: Dict[str, float] = None
+    constraint_weights: Dict[str, float] = None
+    adaptive_weights: bool = True
     
-    定义耦合优化阶段的通用接口，包括：
-    - 多物理场耦合优化
-    - 多尺度协调优化
-    - 自适应权重调整
-    - 收敛性监控
+    def __post_init__(self):
+        if self.objective_weights is None:
+            self.objective_weights = {
+                'physics_loss': 1.0,
+                'data_loss': 1.0,
+                'boundary_loss': 0.5,
+                'regularization_loss': 0.1
+            }
+        
+        if self.constraint_weights is None:
+            self.constraint_weights = {
+                'equality': 10.0,
+                'inequality': 5.0,
+                'physics': 2.0,
+                'data': 1.0
+            }
+
+class ObjectiveFunction:
+    """
+    目标函数基类
+    
+    定义多目标优化中的单个目标
     """
     
-    def __init__(self, 
-                 model: nn.Module,
-                 optimizer_config: Dict[str, Any],
-                 physics_config: Dict[str, Any],
-                 coupling_config: Dict[str, Any]):
+    def __init__(self, name: str, weight: float = 1.0, minimize: bool = True):
         """
-        初始化耦合优化阶段
+        初始化目标函数
         
         Args:
-            model: PINNs模型
-            optimizer_config: 优化器配置
-            physics_config: 物理约束配置
-            coupling_config: 耦合配置
+            name: 目标函数名称
+            weight: 权重
+            minimize: 是否最小化
+        """
+        self.name = name
+        self.weight = weight
+        self.minimize = minimize
+        self.history = []
+    
+    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                 model: nn.Module = None, **kwargs) -> torch.Tensor:
+        """
+        计算目标函数值
+        
+        Args:
+            predictions: 预测值
+            targets: 目标值
+            model: 模型（可选）
+            **kwargs: 其他参数
+            
+        Returns:
+            Tensor: 目标函数值
+        """
+        raise NotImplementedError
+    
+    def update_history(self, value: float) -> None:
+        """更新历史记录"""
+        self.history.append(value)
+        if len(self.history) > 1000:  # 限制历史长度
+            self.history.pop(0)
+
+class PhysicsObjective(ObjectiveFunction):
+    """物理目标函数"""
+    
+    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                 model: nn.Module = None, **kwargs) -> torch.Tensor:
+        # 物理方程残差
+        physics_residual = kwargs.get('physics_residual', torch.tensor(0.0))
+        return torch.mean(physics_residual ** 2)
+
+class DataObjective(ObjectiveFunction):
+    """数据拟合目标函数"""
+    
+    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                 model: nn.Module = None, **kwargs) -> torch.Tensor:
+        return nn.MSELoss()(predictions, targets)
+
+class BoundaryObjective(ObjectiveFunction):
+    """边界条件目标函数"""
+    
+    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                 model: nn.Module = None, **kwargs) -> torch.Tensor:
+        boundary_residual = kwargs.get('boundary_residual', torch.tensor(0.0))
+        return torch.mean(boundary_residual ** 2)
+
+class RegularizationObjective(ObjectiveFunction):
+    """正则化目标函数"""
+    
+    def __call__(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                 model: nn.Module = None, **kwargs) -> torch.Tensor:
+        if model is None:
+            return torch.tensor(0.0)
+        
+        l2_reg = torch.tensor(0.0)
+        for param in model.parameters():
+            l2_reg += torch.norm(param) ** 2
+        
+        return l2_reg
+
+class ConstraintFunction:
+    """
+    约束函数基类
+    """
+    
+    def __init__(self, name: str, constraint_type: ConstraintType, 
+                 weight: float = 1.0, tolerance: float = 1e-6):
+        """
+        初始化约束函数
+        
+        Args:
+            name: 约束名称
+            constraint_type: 约束类型
+            weight: 权重
+            tolerance: 容忍度
+        """
+        self.name = name
+        self.constraint_type = constraint_type
+        self.weight = weight
+        self.tolerance = tolerance
+        self.violation_history = []
+    
+    def __call__(self, predictions: torch.Tensor, model: nn.Module = None, 
+                 **kwargs) -> torch.Tensor:
+        """
+        计算约束违反程度
+        
+        Args:
+            predictions: 预测值
+            model: 模型
+            **kwargs: 其他参数
+            
+        Returns:
+            Tensor: 约束违反程度
+        """
+        raise NotImplementedError
+    
+    def update_violation_history(self, violation: float) -> None:
+        """更新违反历史"""
+        self.violation_history.append(violation)
+        if len(self.violation_history) > 1000:
+            self.violation_history.pop(0)
+
+class EqualityConstraint(ConstraintFunction):
+    """等式约束"""
+    
+    def __init__(self, name: str, target_value: float = 0.0, **kwargs):
+        super().__init__(name, ConstraintType.EQUALITY, **kwargs)
+        self.target_value = target_value
+    
+    def __call__(self, predictions: torch.Tensor, model: nn.Module = None, 
+                 **kwargs) -> torch.Tensor:
+        constraint_value = kwargs.get('constraint_value', predictions)
+        violation = torch.abs(constraint_value - self.target_value)
+        return torch.mean(violation)
+
+class InequalityConstraint(ConstraintFunction):
+    """不等式约束"""
+    
+    def __init__(self, name: str, upper_bound: float = None, 
+                 lower_bound: float = None, **kwargs):
+        super().__init__(name, ConstraintType.INEQUALITY, **kwargs)
+        self.upper_bound = upper_bound
+        self.lower_bound = lower_bound
+    
+    def __call__(self, predictions: torch.Tensor, model: nn.Module = None, 
+                 **kwargs) -> torch.Tensor:
+        constraint_value = kwargs.get('constraint_value', predictions)
+        violation = torch.tensor(0.0)
+        
+        if self.upper_bound is not None:
+            upper_violation = torch.clamp(constraint_value - self.upper_bound, min=0)
+            violation += torch.mean(upper_violation)
+        
+        if self.lower_bound is not None:
+            lower_violation = torch.clamp(self.lower_bound - constraint_value, min=0)
+            violation += torch.mean(lower_violation)
+        
+        return violation
+
+class AdaptiveWeightManager:
+    """
+    自适应权重管理器
+    
+    根据优化过程动态调整目标函数和约束的权重
+    """
+    
+    def __init__(self, config: CoupledOptimizationConfig):
+        """
+        初始化权重管理器
+        
+        Args:
+            config: 耦合优化配置
+        """
+        self.config = config
+        self.objective_weights = config.objective_weights.copy()
+        self.constraint_weights = config.constraint_weights.copy()
+        self.adaptation_history = []
+        self.performance_history = []
+        self.logger = logging.getLogger(__name__)
+    
+    def update_weights(self, objective_values: Dict[str, float], 
+                      constraint_violations: Dict[str, float],
+                      iteration: int) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """
+        更新权重
+        
+        Args:
+            objective_values: 目标函数值
+            constraint_violations: 约束违反程度
+            iteration: 当前迭代次数
+            
+        Returns:
+            Tuple: 更新后的目标权重和约束权重
+        """
+        if not self.config.adaptive_weights:
+            return self.objective_weights, self.constraint_weights
+        
+        # 记录性能历史
+        total_objective = sum(objective_values.values())
+        total_violation = sum(constraint_violations.values())
+        self.performance_history.append({
+            'iteration': iteration,
+            'total_objective': total_objective,
+            'total_violation': total_violation,
+            'objectives': objective_values.copy(),
+            'violations': constraint_violations.copy()
+        })
+        
+        # 保持历史长度
+        if len(self.performance_history) > self.config.convergence_window * 2:
+            self.performance_history.pop(0)
+        
+        # 计算改进率
+        if len(self.performance_history) >= self.config.convergence_window:
+            recent_performance = self.performance_history[-self.config.convergence_window:]
+            
+            # 目标函数改进率
+            objective_improvement = self._calculate_improvement_rate(
+                [p['total_objective'] for p in recent_performance]
+            )
+            
+            # 约束违反改进率
+            violation_improvement = self._calculate_improvement_rate(
+                [p['total_violation'] for p in recent_performance]
+            )
+            
+            # 调整权重
+            self._adapt_objective_weights(objective_values, objective_improvement)
+            self._adapt_constraint_weights(constraint_violations, violation_improvement)
+        
+        return self.objective_weights, self.constraint_weights
+    
+    def _calculate_improvement_rate(self, values: List[float]) -> float:
+        """计算改进率"""
+        if len(values) < 2:
+            return 0.0
+        
+        # 使用线性回归计算趋势
+        x = np.arange(len(values))
+        y = np.array(values)
+        
+        if np.std(y) < 1e-10:  # 避免除零
+            return 0.0
+        
+        # 计算斜率（标准化）
+        slope = np.polyfit(x, y, 1)[0]
+        normalized_slope = slope / (np.mean(y) + 1e-10)
+        
+        return -normalized_slope  # 负斜率表示改进
+    
+    def _adapt_objective_weights(self, objective_values: Dict[str, float], 
+                                improvement_rate: float) -> None:
+        """调整目标权重"""
+        adaptation_rate = self.config.weight_adaptation_rate
+        
+        # 如果改进缓慢，增加表现差的目标的权重
+        if improvement_rate < 0.01:
+            max_value = max(objective_values.values()) if objective_values else 1.0
+            
+            for name, value in objective_values.items():
+                if name in self.objective_weights:
+                    # 表现差的目标增加权重
+                    relative_performance = value / (max_value + 1e-10)
+                    weight_adjustment = adaptation_rate * relative_performance
+                    self.objective_weights[name] *= (1 + weight_adjustment)
+        
+        # 权重归一化
+        total_weight = sum(self.objective_weights.values())
+        if total_weight > 0:
+            for name in self.objective_weights:
+                self.objective_weights[name] /= total_weight
+                self.objective_weights[name] *= len(self.objective_weights)
+    
+    def _adapt_constraint_weights(self, constraint_violations: Dict[str, float], 
+                                 improvement_rate: float) -> None:
+        """调整约束权重"""
+        adaptation_rate = self.config.weight_adaptation_rate
+        
+        # 如果约束违反严重，增加约束权重
+        for name, violation in constraint_violations.items():
+            if violation > 1e-6:  # 有显著违反
+                if name in self.constraint_weights:
+                    # 违反越严重，权重增加越多
+                    weight_multiplier = 1 + adaptation_rate * np.log(1 + violation)
+                    self.constraint_weights[name] *= weight_multiplier
+            else:
+                # 约束满足良好，可以适度减少权重
+                if name in self.constraint_weights:
+                    self.constraint_weights[name] *= (1 - adaptation_rate * 0.1)
+        
+        # 确保权重不会过小
+        for name in self.constraint_weights:
+            self.constraint_weights[name] = max(self.constraint_weights[name], 0.01)
+
+class ParetoOptimizer:
+    """
+    帕累托优化器
+    
+    实现多目标帕累托优化
+    """
+    
+    def __init__(self, objectives: List[ObjectiveFunction], 
+                 constraints: List[ConstraintFunction],
+                 config: CoupledOptimizationConfig):
+        """
+        初始化帕累托优化器
+        
+        Args:
+            objectives: 目标函数列表
+            constraints: 约束函数列表
+            config: 配置
+        """
+        self.objectives = objectives
+        self.constraints = constraints
+        self.config = config
+        self.pareto_front = []
+        self.population = []
+        self.logger = logging.getLogger(__name__)
+    
+    def optimize(self, model: nn.Module, data_loader, 
+                 num_generations: int = 100) -> List[Dict[str, Any]]:
+        """
+        执行帕累托优化
+        
+        Args:
+            model: 模型
+            data_loader: 数据加载器
+            num_generations: 代数
+            
+        Returns:
+            List: 帕累托前沿解集
+        """
+        # 初始化种群
+        self._initialize_population(model)
+        
+        for generation in range(num_generations):
+            # 评估种群
+            fitness_values = self._evaluate_population(model, data_loader)
+            
+            # 更新帕累托前沿
+            self._update_pareto_front(fitness_values)
+            
+            # 选择和变异
+            self._evolve_population()
+            
+            if generation % 10 == 0:
+                self.logger.info(f"Generation {generation}, Pareto front size: {len(self.pareto_front)}")
+        
+        return self.pareto_front
+    
+    def _initialize_population(self, model: nn.Module) -> None:
+        """初始化种群"""
+        # 保存原始参数
+        original_params = [param.clone() for param in model.parameters()]
+        
+        self.population = []
+        for _ in range(self.config.pareto_population_size):
+            # 随机扰动参数
+            individual = []
+            for param in model.parameters():
+                noise = torch.randn_like(param) * 0.01
+                individual.append(param + noise)
+            self.population.append(individual)
+        
+        # 恢复原始参数
+        for param, original in zip(model.parameters(), original_params):
+            param.data.copy_(original)
+    
+    def _evaluate_population(self, model: nn.Module, data_loader) -> List[Dict[str, float]]:
+        """评估种群适应度"""
+        fitness_values = []
+        
+        # 保存原始参数
+        original_params = [param.clone() for param in model.parameters()]
+        
+        for individual in self.population:
+            # 设置个体参数
+            for param, individual_param in zip(model.parameters(), individual):
+                param.data.copy_(individual_param)
+            
+            # 评估目标函数
+            objective_values = {}
+            constraint_violations = {}
+            
+            model.eval()
+            with torch.no_grad():
+                total_objectives = {obj.name: 0.0 for obj in self.objectives}
+                total_constraints = {const.name: 0.0 for const in self.constraints}
+                num_batches = 0
+                
+                for batch_data in data_loader:
+                    if len(batch_data) == 2:
+                        inputs, targets = batch_data
+                    else:
+                        inputs, targets = batch_data[0], batch_data[1]
+                    
+                    predictions = model(inputs)
+                    
+                    # 计算目标函数
+                    for obj in self.objectives:
+                        obj_value = obj(predictions, targets, model).item()
+                        total_objectives[obj.name] += obj_value
+                    
+                    # 计算约束违反
+                    for const in self.constraints:
+                        const_violation = const(predictions, model).item()
+                        total_constraints[const.name] += const_violation
+                    
+                    num_batches += 1
+                
+                # 平均化
+                for name in total_objectives:
+                    objective_values[name] = total_objectives[name] / num_batches
+                
+                for name in total_constraints:
+                    constraint_violations[name] = total_constraints[name] / num_batches
+            
+            fitness_values.append({
+                'objectives': objective_values,
+                'constraints': constraint_violations,
+                'individual': [param.clone() for param in individual]
+            })
+        
+        # 恢复原始参数
+        for param, original in zip(model.parameters(), original_params):
+            param.data.copy_(original)
+        
+        return fitness_values
+    
+    def _update_pareto_front(self, fitness_values: List[Dict[str, Any]]) -> None:
+        """更新帕累托前沿"""
+        # 合并当前种群和帕累托前沿
+        all_solutions = fitness_values + self.pareto_front
+        
+        # 找到非支配解
+        pareto_solutions = []
+        
+        for i, solution_i in enumerate(all_solutions):
+            is_dominated = False
+            
+            for j, solution_j in enumerate(all_solutions):
+                if i != j and self._dominates(solution_j, solution_i):
+                    is_dominated = True
+                    break
+            
+            if not is_dominated:
+                pareto_solutions.append(solution_i)
+        
+        self.pareto_front = pareto_solutions
+    
+    def _dominates(self, solution_a: Dict[str, Any], solution_b: Dict[str, Any]) -> bool:
+        """判断解A是否支配解B"""
+        objectives_a = solution_a['objectives']
+        objectives_b = solution_b['objectives']
+        constraints_a = solution_a['constraints']
+        constraints_b = solution_b['constraints']
+        
+        # 首先检查约束违反
+        total_violation_a = sum(constraints_a.values())
+        total_violation_b = sum(constraints_b.values())
+        
+        # 如果A可行而B不可行，A支配B
+        if total_violation_a <= 1e-6 and total_violation_b > 1e-6:
+            return True
+        
+        # 如果B可行而A不可行，A不支配B
+        if total_violation_b <= 1e-6 and total_violation_a > 1e-6:
+            return False
+        
+        # 比较目标函数
+        better_in_all = True
+        better_in_at_least_one = False
+        
+        for obj_name in objectives_a:
+            if obj_name in objectives_b:
+                if objectives_a[obj_name] > objectives_b[obj_name]:  # 假设最小化
+                    better_in_all = False
+                elif objectives_a[obj_name] < objectives_b[obj_name]:
+                    better_in_at_least_one = True
+        
+        return better_in_all and better_in_at_least_one
+    
+    def _evolve_population(self) -> None:
+        """进化种群"""
+        # 简单的进化策略：从帕累托前沿选择父代，进行变异
+        if len(self.pareto_front) == 0:
+            return
+        
+        new_population = []
+        
+        for _ in range(self.config.pareto_population_size):
+            # 随机选择父代
+            parent = np.random.choice(self.pareto_front)
+            
+            # 变异
+            offspring = []
+            for param in parent['individual']:
+                mutation = torch.randn_like(param) * 0.001
+                offspring.append(param + mutation)
+            
+            new_population.append(offspring)
+        
+        self.population = new_population
+
+class CoupledOptimizationTrainer:
+    """
+    耦合优化训练器
+    
+    管理多目标耦合优化的训练过程
+    """
+    
+    def __init__(self, model: nn.Module, objectives: List[ObjectiveFunction],
+                 constraints: List[ConstraintFunction], config: CoupledOptimizationConfig):
+        """
+        初始化耦合优化训练器
+        
+        Args:
+            model: 模型
+            objectives: 目标函数列表
+            constraints: 约束函数列表
+            config: 配置
         """
         self.model = model
-        self.optimizer_config = optimizer_config
-        self.physics_config = physics_config
-        self.coupling_config = coupling_config
-        self.train_state = None
-        self.optimization_history = []
+        self.objectives = objectives
+        self.constraints = constraints
+        self.config = config
+        self.weight_manager = AdaptiveWeightManager(config)
+        self.optimizer = None
+        self.training_history = []
+        self.convergence_metrics = []
+        self.logger = logging.getLogger(__name__)
         
-    @abstractmethod
-    def initialize_coupled_optimization(self, 
-                                      physics_integrated_state: train_state.TrainState,
-                                      sample_input: Dict[str, jnp.ndarray]) -> train_state.TrainState:
-        """
-        初始化耦合优化训练状态
-        
-        Args:
-            physics_integrated_state: 物理集成后的状态
-            sample_input: 样本输入
-            
-        Returns:
-            耦合优化训练状态
-        """
-        pass
-        
-    @abstractmethod
-    def coupled_optimization_step(self, 
-                                 state: train_state.TrainState,
-                                 batch: Dict[str, jnp.ndarray],
-                                 rng_key: jax.random.PRNGKey) -> Tuple[train_state.TrainState, Dict[str, float]]:
-        """
-        执行一步耦合优化
-        
-        Args:
-            state: 当前训练状态
-            batch: 训练批次
-            rng_key: 随机数生成器密钥
-            
-        Returns:
-            更新后的训练状态和损失信息
-        """
-        pass
-        
-    def run_coupled_optimization(self, 
-                                physics_integrated_state: train_state.TrainState,
-                                training_data: Dict[str, jnp.ndarray],
-                                n_epochs: int,
-                                batch_size: int,
-                                rng_key: jax.random.PRNGKey) -> train_state.TrainState:
-        """
-        运行完整的耦合优化过程
-        
-        Args:
-            physics_integrated_state: 物理集成后的状态
-            training_data: 训练数据
-            n_epochs: 训练轮数
-            batch_size: 批次大小
-            rng_key: 随机数生成器密钥
-            
-        Returns:
-            耦合优化完成的状态
-        """
-        # 初始化耦合优化状态
-        sample_input = {k: v[:1] for k, v in training_data.items() if k in ['x', 'y', 't']}
-        self.train_state = self.initialize_coupled_optimization(
-            physics_integrated_state, sample_input
-        )
-        
-        # 创建数据批次
-        n_samples = len(training_data['x'])
-        n_batches = (n_samples + batch_size - 1) // batch_size
-        
-        # 收敛监控
-        convergence_window = self.coupling_config.get('convergence_window', 50)
-        convergence_threshold = self.coupling_config.get('convergence_threshold', 1e-6)
-        
-        for epoch in range(n_epochs):
-            epoch_losses = {
-                'total': 0.0, 'physics': 0.0, 'data': 0.0, 
-                'coupling': 0.0, 'multiscale': 0.0
-            }
-            
-            # 打乱数据
-            rng_key, shuffle_key = jax.random.split(rng_key)
-            perm = jax.random.permutation(shuffle_key, n_samples)
-            
-            for batch_idx in range(n_batches):
-                # 创建批次
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, n_samples)
-                batch_indices = perm[start_idx:end_idx]
-                
-                batch = {k: v[batch_indices] for k, v in training_data.items()}
-                
-                # 执行耦合优化步骤
-                rng_key, step_key = jax.random.split(rng_key)
-                self.train_state, loss_info = self.coupled_optimization_step(
-                    self.train_state, batch, step_key
-                )
-                
-                # 累积损失
-                for key in epoch_losses:
-                    if key in loss_info:
-                        epoch_losses[key] += loss_info[key]
-                        
-            # 记录优化历史
-            avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
-            self.optimization_history.append(avg_losses)
-            
-            # 打印进度
-            if epoch % 25 == 0:
-                print(f"Coupled Optimization Epoch {epoch}:")
-                for key, value in avg_losses.items():
-                    print(f"  {key}_loss: {value:.6f}")
-                    
-            # 检查收敛性
-            if self._check_convergence(convergence_window, convergence_threshold):
-                print(f"Converged at epoch {epoch}")
-                break
-                
-        return self.train_state
-        
-    def _check_convergence(self, window: int, threshold: float) -> bool:
-        """
-        检查优化收敛性
-        
-        Args:
-            window: 收敛检查窗口
-            threshold: 收敛阈值
-            
-        Returns:
-            是否收敛
-        """
-        if len(self.optimization_history) < window:
-            return False
-            
-        recent_losses = [h['total'] for h in self.optimization_history[-window:]]
-        
-        # 计算损失变化的标准差
-        loss_std = jnp.std(jnp.array(recent_losses))
-        
-        return loss_std < threshold
-
-class MultiPhysicsCoupledOptimization(CoupledOptimizationStage):
-    """
-    多物理场耦合优化
+        # 根据优化类型初始化特定优化器
+        if config.optimization_type == OptimizationType.PARETO:
+            self.pareto_optimizer = ParetoOptimizer(objectives, constraints, config)
     
-    实现多个物理场之间的耦合优化，包括：
-    - 热-力耦合
-    - 流-固耦合
-    - 质量-动量耦合
-    """
+    def setup_optimizer(self, learning_rate: float = 1e-3, 
+                       weight_decay: float = 1e-4) -> None:
+        """
+        设置优化器
+        
+        Args:
+            learning_rate: 学习率
+            weight_decay: 权重衰减
+        """
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
     
-    def initialize_coupled_optimization(self, 
-                                     physics_integrated_state: train_state.TrainState,
-                                     sample_input: Dict[str, jnp.ndarray]) -> train_state.TrainState:
+    def compute_total_loss(self, predictions: torch.Tensor, targets: torch.Tensor,
+                          iteration: int, **kwargs) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, float]]:
         """
-        初始化多物理场耦合优化的训练状态
+        计算总损失
+        
+        Args:
+            predictions: 预测值
+            targets: 目标值
+            iteration: 迭代次数
+            **kwargs: 其他参数
+            
+        Returns:
+            Tuple: (总损失, 目标函数值, 约束违反程度)
         """
-        # 使用物理集成后的参数
-        params = physics_integrated_state.params
+        # 计算各个目标函数
+        objective_values = {}
+        for obj in self.objectives:
+            obj_value = obj(predictions, targets, self.model, **kwargs)
+            objective_values[obj.name] = obj_value.item()
         
-        # 创建多阶段优化器
-        learning_rate = self.optimizer_config.get('coupled_learning_rate', 1e-4)
+        # 计算约束违反
+        constraint_violations = {}
+        for const in self.constraints:
+            const_violation = const(predictions, self.model, **kwargs)
+            constraint_violations[const.name] = const_violation.item()
         
-        # 使用余弦退火调度
-        schedule = optax.cosine_onecycle_schedule(
-            transition_steps=self.coupling_config.get('total_steps', 5000),
-            peak_value=learning_rate,
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1e4
+        # 更新权重
+        obj_weights, const_weights = self.weight_manager.update_weights(
+            objective_values, constraint_violations, iteration
         )
         
-        # 组合优化器
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(self.optimizer_config.get('max_grad_norm', 1.0)),
-            optax.adamw(
-                learning_rate=schedule,
-                weight_decay=self.optimizer_config.get('weight_decay', 1e-5),
-                b1=0.9,
-                b2=0.999
-            )
-        )
+        # 计算加权总损失
+        total_loss = torch.tensor(0.0, device=predictions.device)
         
-        return train_state.TrainState.create(
-            apply_fn=self.model.apply,
-            params=params,
-            tx=optimizer
-        )
+        # 目标函数部分
+        for obj in self.objectives:
+            obj_value = obj(predictions, targets, self.model, **kwargs)
+            weight = obj_weights.get(obj.name, obj.weight)
+            total_loss += weight * obj_value
+            
+            # 更新目标函数历史
+            obj.update_history(obj_value.item())
         
-    def coupled_optimization_step(self, 
-                                 state: train_state.TrainState,
-                                 batch: Dict[str, jnp.ndarray],
-                                 rng_key: jax.random.PRNGKey) -> Tuple[train_state.TrainState, Dict[str, float]]:
+        # 约束部分
+        for const in self.constraints:
+            const_violation = const(predictions, self.model, **kwargs)
+            weight = const_weights.get(const.name, const.weight)
+            
+            if const.constraint_type == ConstraintType.EQUALITY:
+                penalty = weight * const_violation
+            else:  # 不等式约束
+                penalty = weight * torch.clamp(const_violation, min=0)
+            
+            total_loss += penalty
+            
+            # 更新约束违反历史
+            const.update_violation_history(const_violation.item())
+        
+        return total_loss, objective_values, constraint_violations
+    
+    def train_epoch(self, data_loader, epoch: int) -> Dict[str, float]:
         """
-        执行多物理场耦合优化步骤
+        训练一个epoch
+        
+        Args:
+            data_loader: 数据加载器
+            epoch: 当前epoch
+            
+        Returns:
+            Dict: 训练指标
         """
-        def loss_fn(params):
+        self.model.train()
+        
+        epoch_objectives = {obj.name: 0.0 for obj in self.objectives}
+        epoch_constraints = {const.name: 0.0 for const in self.constraints}
+        epoch_total_loss = 0.0
+        num_batches = 0
+        
+        for batch_idx, batch_data in enumerate(data_loader):
+            if len(batch_data) == 2:
+                inputs, targets = batch_data
+                kwargs = {}
+            else:
+                inputs, targets = batch_data[0], batch_data[1]
+                kwargs = batch_data[2] if len(batch_data) > 2 else {}
+            
+            self.optimizer.zero_grad()
+            
             # 前向传播
-            predictions = state.apply_fn(params, batch)
+            predictions = self.model(inputs)
             
-            # 计算各种耦合损失
-            thermal_mechanical_coupling = self._thermal_mechanical_coupling_loss(
-                params, batch, state.apply_fn
+            # 计算损失
+            iteration = epoch * len(data_loader) + batch_idx
+            total_loss, objective_values, constraint_violations = self.compute_total_loss(
+                predictions, targets, iteration, **kwargs
             )
             
-            fluid_solid_coupling = self._fluid_solid_coupling_loss(
-                params, batch, state.apply_fn
-            )
+            # 反向传播
+            total_loss.backward()
             
-            mass_momentum_coupling = self._mass_momentum_coupling_loss(
-                params, batch, state.apply_fn
-            )
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
-            # 物理一致性损失
-            physics_consistency = self._physics_consistency_loss(
-                params, batch, state.apply_fn
-            )
+            self.optimizer.step()
             
-            # 数据拟合损失
-            data_loss = 0.0
-            if 'observations' in batch:
-                data_loss = self._compute_weighted_data_loss(
-                    predictions, batch['observations']
+            # 累积指标
+            epoch_total_loss += total_loss.item()
+            for name, value in objective_values.items():
+                epoch_objectives[name] += value
+            for name, value in constraint_violations.items():
+                epoch_constraints[name] += value
+            
+            num_batches += 1
+            
+            if batch_idx % 10 == 0:
+                self.logger.info(
+                    f"Epoch {epoch}, Batch {batch_idx}, Total Loss: {total_loss.item():.6f}"
                 )
-                
-            # 耦合损失总和
-            coupling_loss = (
-                thermal_mechanical_coupling + 
-                fluid_solid_coupling + 
-                mass_momentum_coupling
-            )
-            
-            # 总损失
-            total_loss = (
-                self.physics_config.get('coupling_weight', 1.0) * coupling_loss +
-                self.physics_config.get('consistency_weight', 0.5) * physics_consistency +
-                self.physics_config.get('data_weight', 0.1) * data_loss
-            )
-            
-            return total_loss, {
-                'total_loss': total_loss,
-                'coupling_loss': coupling_loss,
-                'thermal_mechanical_coupling': thermal_mechanical_coupling,
-                'fluid_solid_coupling': fluid_solid_coupling,
-                'mass_momentum_coupling': mass_momentum_coupling,
-                'physics_consistency': physics_consistency,
-                'data_loss': data_loss
-            }
-            
-        # 计算梯度
-        (loss, loss_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
         
-        # 更新参数
-        new_state = state.apply_gradients(grads=grads)
-        
-        return new_state, loss_info
-        
-    def _thermal_mechanical_coupling_loss(self, 
-                                         params: Dict,
-                                         batch: Dict[str, jnp.ndarray],
-                                         apply_fn: Callable) -> float:
-        """
-        热-力耦合损失
-        
-        温度影响冰的流动参数，应力影响温度分布
-        """
-        def model_outputs(x, y, t):
-            inputs = {'x': x, 'y': y, 't': t}
-            return apply_fn(params, inputs)
-            
-        # 检查模型是否包含温度场
-        sample_output = model_outputs(batch['x'][0], batch['y'][0], batch['t'][0])
-        if 'temperature' not in sample_output:
-            return 0.0
-            
-        outputs = jax.vmap(model_outputs)(batch['x'], batch['y'], batch['t'])
-        temperature = outputs['temperature']
-        velocity_x = outputs['velocity_x']
-        velocity_y = outputs['velocity_y']
-        
-        # 计算应变率
-        def velocity_x_fn(x, y, t):
-            return model_outputs(x, y, t)['velocity_x']
-            
-        def velocity_y_fn(x, y, t):
-            return model_outputs(x, y, t)['velocity_y']
-            
-        dvx_dx = jax.vmap(jax.grad(velocity_x_fn, argnums=0))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dvy_dy = jax.vmap(jax.grad(velocity_y_fn, argnums=1))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dvx_dy = jax.vmap(jax.grad(velocity_x_fn, argnums=1))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dvy_dx = jax.vmap(jax.grad(velocity_y_fn, argnums=0))(
-            batch['x'], batch['y'], batch['t']
-        )
-        
-        # 应变率第二不变量
-        epsilon_xx = dvx_dx
-        epsilon_yy = dvy_dy
-        epsilon_xy = 0.5 * (dvx_dy + dvy_dx)
-        
-        epsilon_II = jnp.sqrt(
-            epsilon_xx**2 + epsilon_yy**2 + 2 * epsilon_xy**2 + 1e-12
-        )
-        
-        # 温度依赖的流动参数
-        def arrhenius_factor(T):
-            # Arrhenius关系：A(T) = A0 * exp(-Q/RT)
-            T_kelvin = T + 273.15
-            Q = 60000.0  # 激活能 (J/mol)
-            R = 8.314    # 气体常数 (J/mol/K)
-            A0 = 2.4e-24 # 参考流动参数
-            
-            return A0 * jnp.exp(-Q / (R * T_kelvin))
-            
-        A_T = jax.vmap(arrhenius_factor)(temperature)
-        
-        # Glen's law with temperature dependence
-        n = 3.0
-        tau_e_predicted = (epsilon_II / A_T)**(1/n)
-        
-        # 简化的应力计算
-        eta = 1e12  # 有效粘度
-        tau_e_computed = eta * epsilon_II
-        
-        # 热-力耦合残差
-        thermal_mechanical_residual = tau_e_predicted - tau_e_computed
-        
-        return jnp.mean(thermal_mechanical_residual**2)
-        
-    def _fluid_solid_coupling_loss(self, 
-                                  params: Dict,
-                                  batch: Dict[str, jnp.ndarray],
-                                  apply_fn: Callable) -> float:
-        """
-        流-固耦合损失
-        
-        冰川流动与固体变形的耦合
-        """
-        def model_outputs(x, y, t):
-            inputs = {'x': x, 'y': y, 't': t}
-            return apply_fn(params, inputs)
-            
-        outputs = jax.vmap(model_outputs)(batch['x'], batch['y'], batch['t'])
-        thickness = outputs['thickness']
-        velocity_x = outputs['velocity_x']
-        velocity_y = outputs['velocity_y']
-        
-        # 计算厚度梯度
-        def thickness_fn(x, y, t):
-            return model_outputs(x, y, t)['thickness']
-            
-        dh_dx = jax.vmap(jax.grad(thickness_fn, argnums=0))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dh_dy = jax.vmap(jax.grad(thickness_fn, argnums=1))(
-            batch['x'], batch['y'], batch['t']
-        )
-        
-        # 流-固耦合条件：速度应该与厚度梯度相关
-        # 简化的关系：v ∝ ∇h
-        coupling_factor = 1e-3
-        
-        velocity_magnitude = jnp.sqrt(velocity_x**2 + velocity_y**2 + 1e-12)
-        thickness_gradient_magnitude = jnp.sqrt(dh_dx**2 + dh_dy**2 + 1e-12)
-        
-        # 耦合残差
-        coupling_residual = velocity_magnitude - coupling_factor * thickness_gradient_magnitude
-        
-        return jnp.mean(coupling_residual**2)
-        
-    def _mass_momentum_coupling_loss(self, 
-                                    params: Dict,
-                                    batch: Dict[str, jnp.ndarray],
-                                    apply_fn: Callable) -> float:
-        """
-        质量-动量耦合损失
-        
-        质量守恒和动量守恒的耦合一致性
-        """
-        def model_outputs(x, y, t):
-            inputs = {'x': x, 'y': y, 't': t}
-            return apply_fn(params, inputs)
-            
-        # 计算质量通量
-        def mass_flux_x(x, y, t):
-            out = model_outputs(x, y, t)
-            return out['thickness'] * out['velocity_x']
-            
-        def mass_flux_y(x, y, t):
-            out = model_outputs(x, y, t)
-            return out['thickness'] * out['velocity_y']
-            
-        # 计算动量
-        outputs = jax.vmap(model_outputs)(batch['x'], batch['y'], batch['t'])
-        rho = 917.0  # 冰密度
-        
-        momentum_x = rho * outputs['thickness'] * outputs['velocity_x']
-        momentum_y = rho * outputs['thickness'] * outputs['velocity_y']
-        
-        # 质量-动量一致性：动量变化应该与质量通量变化一致
-        dflux_x_dt = jax.vmap(jax.grad(mass_flux_x, argnums=2))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dflux_y_dt = jax.vmap(jax.grad(mass_flux_y, argnums=2))(
-            batch['x'], batch['y'], batch['t']
-        )
-        
-        def momentum_x_fn(x, y, t):
-            out = model_outputs(x, y, t)
-            return rho * out['thickness'] * out['velocity_x']
-            
-        def momentum_y_fn(x, y, t):
-            out = model_outputs(x, y, t)
-            return rho * out['thickness'] * out['velocity_y']
-            
-        dmom_x_dt = jax.vmap(jax.grad(momentum_x_fn, argnums=2))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dmom_y_dt = jax.vmap(jax.grad(momentum_y_fn, argnums=2))(
-            batch['x'], batch['y'], batch['t']
-        )
-        
-        # 耦合残差
-        coupling_x_residual = dmom_x_dt - rho * dflux_x_dt
-        coupling_y_residual = dmom_y_dt - rho * dflux_y_dt
-        
-        return jnp.mean(coupling_x_residual**2 + coupling_y_residual**2)
-        
-    def _physics_consistency_loss(self, 
-                                 params: Dict,
-                                 batch: Dict[str, jnp.ndarray],
-                                 apply_fn: Callable) -> float:
-        """
-        物理一致性损失
-        
-        确保所有物理量在物理上是一致的
-        """
-        outputs = apply_fn(params, batch)
-        
-        consistency_loss = 0.0
-        
-        # 厚度非负性
-        thickness = outputs['thickness']
-        thickness_constraint = jnp.mean(jnp.maximum(0.0, -thickness)**2)
-        consistency_loss += thickness_constraint
-        
-        # 速度合理性
-        velocity_x = outputs['velocity_x']
-        velocity_y = outputs['velocity_y']
-        velocity_magnitude = jnp.sqrt(velocity_x**2 + velocity_y**2)
-        
-        # 限制最大速度（例如，不超过2000 m/year）
-        max_velocity = 2000.0
-        velocity_constraint = jnp.mean(
-            jnp.maximum(0.0, velocity_magnitude - max_velocity)**2
-        )
-        consistency_loss += velocity_constraint
-        
-        # 温度合理性（如果存在）
-        if 'temperature' in outputs:
-            temperature = outputs['temperature']
-            # 温度应该在合理范围内（-50°C 到 0°C）
-            temp_lower_bound = jnp.mean(jnp.maximum(0.0, -50.0 - temperature)**2)
-            temp_upper_bound = jnp.mean(jnp.maximum(0.0, temperature - 0.0)**2)
-            consistency_loss += temp_lower_bound + temp_upper_bound
-            
-        return consistency_loss
-        
-    def _compute_weighted_data_loss(self, 
-                                   predictions: Dict[str, jnp.ndarray],
-                                   observations: Dict[str, jnp.ndarray]) -> float:
-        """
-        计算加权数据损失
-        """
-        data_loss = 0.0
-        
-        # 变量权重
-        variable_weights = {
-            'thickness': 1.0,
-            'velocity_x': 0.8,
-            'velocity_y': 0.8,
-            'surface_elevation': 0.9,
-            'temperature': 0.6
+        # 计算平均值
+        metrics = {
+            'total_loss': epoch_total_loss / num_batches,
+            'objectives': {name: value / num_batches for name, value in epoch_objectives.items()},
+            'constraints': {name: value / num_batches for name, value in epoch_constraints.items()}
         }
         
-        for key in observations:
-            if key in predictions:
-                pred = predictions[key]
-                obs = observations[key]
-                weight = variable_weights.get(key, 1.0)
-                
-                # 计算相对误差
-                relative_error = jnp.abs(pred - obs) / (jnp.abs(obs) + 1e-6)
-                data_loss += weight * jnp.mean(relative_error**2)
-                
-        return data_loss
-
-class MultiscaleCoupledOptimization(CoupledOptimizationStage):
-    """
-    多尺度耦合优化
+        # 记录训练历史
+        self.training_history.append(metrics)
+        
+        # 分析收敛性
+        convergence_info = self._analyze_convergence()
+        metrics['convergence'] = convergence_info
+        
+        return metrics
     
-    实现多时空尺度的耦合优化，确保模型在不同尺度上的一致性。
-    """
-    
-    def __init__(self, 
-                 model: nn.Module,
-                 optimizer_config: Dict[str, Any],
-                 physics_config: Dict[str, Any],
-                 coupling_config: Dict[str, Any],
-                 multiscale_config: Dict[str, Any]):
-        super().__init__(model, optimizer_config, physics_config, coupling_config)
-        self.multiscale_config = multiscale_config
-        self.scale_weights = self._initialize_scale_weights()
-        
-    def _initialize_scale_weights(self) -> Dict[str, float]:
+    def _analyze_convergence(self) -> Dict[str, Any]:
         """
-        初始化多尺度权重
+        分析收敛性
+        
+        Returns:
+            Dict: 收敛性分析结果
         """
-        spatial_scales = self.multiscale_config.get('spatial_scales', [1.0, 10.0, 100.0])
-        temporal_scales = self.multiscale_config.get('temporal_scales', [0.1, 1.0, 10.0])
+        if len(self.training_history) < self.config.convergence_window:
+            return {'converged': False, 'reason': 'insufficient_data'}
         
-        weights = {}
+        recent_history = self.training_history[-self.config.convergence_window:]
         
-        # 空间尺度权重
-        for i, scale in enumerate(spatial_scales):
-            weights[f'spatial_scale_{i}'] = 1.0 / len(spatial_scales)
+        # 检查总损失收敛
+        total_losses = [h['total_loss'] for h in recent_history]
+        loss_std = np.std(total_losses)
+        loss_mean = np.mean(total_losses)
+        
+        loss_converged = loss_std / (loss_mean + 1e-10) < self.config.tolerance
+        
+        # 检查目标函数收敛
+        objective_converged = True
+        for obj_name in recent_history[0]['objectives']:
+            obj_values = [h['objectives'][obj_name] for h in recent_history]
+            obj_std = np.std(obj_values)
+            obj_mean = np.mean(obj_values)
             
-        # 时间尺度权重
-        for i, scale in enumerate(temporal_scales):
-            weights[f'temporal_scale_{i}'] = 1.0 / len(temporal_scales)
+            if obj_std / (obj_mean + 1e-10) > self.config.tolerance:
+                objective_converged = False
+                break
+        
+        # 检查约束满足
+        constraints_satisfied = True
+        max_violation = 0.0
+        
+        for const_name in recent_history[-1]['constraints']:
+            violation = recent_history[-1]['constraints'][const_name]
+            max_violation = max(max_violation, violation)
             
-        return weights
+            if violation > self.config.tolerance:
+                constraints_satisfied = False
         
-    def initialize_coupled_optimization(self, 
-                                      physics_integrated_state: train_state.TrainState,
-                                      sample_input: Dict[str, jnp.ndarray]) -> train_state.TrainState:
-        """
-        初始化多尺度耦合优化的训练状态
-        """
-        params = physics_integrated_state.params
+        # 综合判断
+        converged = loss_converged and objective_converged and constraints_satisfied
         
-        # 多尺度学习率调度
-        base_lr = self.optimizer_config.get('multiscale_learning_rate', 5e-5)
-        
-        # 使用分段常数调度
-        boundaries = [1000, 3000, 5000]
-        values = [base_lr, base_lr * 0.5, base_lr * 0.1, base_lr * 0.01]
-        
-        schedule = optax.piecewise_constant_schedule(
-            init_value=base_lr,
-            boundaries_and_scales={
-                1000: 0.5,
-                3000: 0.2,
-                5000: 0.1
-            }
-        )
-        
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(0.5),
-            optax.adamw(
-                learning_rate=schedule,
-                weight_decay=1e-6
-            )
-        )
-        
-        return train_state.TrainState.create(
-            apply_fn=self.model.apply,
-            params=params,
-            tx=optimizer
-        )
-        
-    def coupled_optimization_step(self, 
-                                 state: train_state.TrainState,
-                                 batch: Dict[str, jnp.ndarray],
-                                 rng_key: jax.random.PRNGKey) -> Tuple[train_state.TrainState, Dict[str, float]]:
-        """
-        执行多尺度耦合优化步骤
-        """
-        def loss_fn(params):
-            predictions = state.apply_fn(params, batch)
-            
-            # 计算多尺度损失
-            multiscale_loss = self._compute_multiscale_loss(
-                params, batch, state.apply_fn
-            )
-            
-            # 尺度一致性损失
-            scale_consistency_loss = self._scale_consistency_loss(
-                params, batch, state.apply_fn
-            )
-            
-            # 跨尺度耦合损失
-            cross_scale_coupling_loss = self._cross_scale_coupling_loss(
-                params, batch, state.apply_fn
-            )
-            
-            # 数据损失
-            data_loss = 0.0
-            if 'observations' in batch:
-                data_loss = self._compute_multiscale_data_loss(
-                    predictions, batch['observations'], batch
-                )
-                
-            total_loss = (
-                self.physics_config.get('multiscale_weight', 1.0) * multiscale_loss +
-                self.physics_config.get('consistency_weight', 0.5) * scale_consistency_loss +
-                self.physics_config.get('cross_scale_weight', 0.3) * cross_scale_coupling_loss +
-                self.physics_config.get('data_weight', 0.1) * data_loss
-            )
-            
-            return total_loss, {
-                'total_loss': total_loss,
-                'multiscale_loss': multiscale_loss,
-                'scale_consistency_loss': scale_consistency_loss,
-                'cross_scale_coupling_loss': cross_scale_coupling_loss,
-                'data_loss': data_loss
-            }
-            
-        (loss, loss_info), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-        new_state = state.apply_gradients(grads=grads)
-        
-        # 更新尺度权重
-        self._update_scale_weights(loss_info)
-        
-        return new_state, loss_info
-        
-    def _compute_multiscale_loss(self, 
-                                params: Dict,
-                                batch: Dict[str, jnp.ndarray],
-                                apply_fn: Callable) -> float:
-        """
-        计算多尺度损失
-        """
-        multiscale_loss = 0.0
-        
-        # 空间多尺度损失
-        spatial_scales = self.multiscale_config.get('spatial_scales', [1.0, 10.0, 100.0])
-        
-        for i, scale in enumerate(spatial_scales):
-            scale_loss = self._compute_spatial_scale_loss(
-                params, batch, apply_fn, scale
-            )
-            weight = self.scale_weights.get(f'spatial_scale_{i}', 1.0)
-            multiscale_loss += weight * scale_loss
-            
-        # 时间多尺度损失
-        temporal_scales = self.multiscale_config.get('temporal_scales', [0.1, 1.0, 10.0])
-        
-        for i, scale in enumerate(temporal_scales):
-            scale_loss = self._compute_temporal_scale_loss(
-                params, batch, apply_fn, scale
-            )
-            weight = self.scale_weights.get(f'temporal_scale_{i}', 1.0)
-            multiscale_loss += weight * scale_loss
-            
-        return multiscale_loss
-        
-    def _compute_spatial_scale_loss(self, 
-                                   params: Dict,
-                                   batch: Dict[str, jnp.ndarray],
-                                   apply_fn: Callable,
-                                   scale: float) -> float:
-        """
-        计算特定空间尺度的损失
-        """
-        # 根据尺度调整空间导数的权重
-        scale_factor = 1.0 / scale
-        
-        def model_outputs(x, y, t):
-            inputs = {'x': x, 'y': y, 't': t}
-            return apply_fn(params, inputs)
-            
-        # 计算空间导数
-        def thickness_fn(x, y, t):
-            return model_outputs(x, y, t)['thickness']
-            
-        dh_dx = jax.vmap(jax.grad(thickness_fn, argnums=0))(
-            batch['x'], batch['y'], batch['t']
-        )
-        dh_dy = jax.vmap(jax.grad(thickness_fn, argnums=1))(
-            batch['x'], batch['y'], batch['t']
-        )
-        
-        # 尺度调整的梯度损失
-        gradient_magnitude = jnp.sqrt(dh_dx**2 + dh_dy**2 + 1e-12)
-        scale_adjusted_loss = jnp.mean((scale_factor * gradient_magnitude)**2)
-        
-        return scale_adjusted_loss
-        
-    def _compute_temporal_scale_loss(self, 
-                                    params: Dict,
-                                    batch: Dict[str, jnp.ndarray],
-                                    apply_fn: Callable,
-                                    scale: float) -> float:
-        """
-        计算特定时间尺度的损失
-        """
-        # 根据尺度调整时间导数的权重
-        scale_factor = 1.0 / scale
-        
-        def model_outputs(x, y, t):
-            inputs = {'x': x, 'y': y, 't': t}
-            return apply_fn(params, inputs)
-            
-        # 计算时间导数
-        def thickness_fn(x, y, t):
-            return model_outputs(x, y, t)['thickness']
-            
-        dh_dt = jax.vmap(jax.grad(thickness_fn, argnums=2))(
-            batch['x'], batch['y'], batch['t']
-        )
-        
-        # 尺度调整的时间导数损失
-        temporal_loss = jnp.mean((scale_factor * dh_dt)**2)
-        
-        return temporal_loss
-        
-    def _scale_consistency_loss(self, 
-                               params: Dict,
-                               batch: Dict[str, jnp.ndarray],
-                               apply_fn: Callable) -> float:
-        """
-        尺度一致性损失
-        
-        确保模型在不同尺度上的预测是一致的
-        """
-        # 在不同尺度的点上评估模型
-        outputs_fine = apply_fn(params, batch)
-        
-        # 创建粗尺度采样点
-        coarse_factor = 2
-        coarse_indices = jnp.arange(0, len(batch['x']), coarse_factor)
-        
-        if len(coarse_indices) == 0:
-            return 0.0
-            
-        coarse_batch = {
-            k: v[coarse_indices] for k, v in batch.items() 
-            if k in ['x', 'y', 't']
+        convergence_info = {
+            'converged': converged,
+            'loss_converged': loss_converged,
+            'objective_converged': objective_converged,
+            'constraints_satisfied': constraints_satisfied,
+            'max_constraint_violation': max_violation,
+            'loss_stability': loss_std / (loss_mean + 1e-10)
         }
         
-        outputs_coarse = apply_fn(params, coarse_batch)
+        self.convergence_metrics.append(convergence_info)
         
-        # 比较细尺度和粗尺度的预测
-        consistency_loss = 0.0
-        
-        for key in outputs_fine:
-            if key in outputs_coarse:
-                fine_values = outputs_fine[key][coarse_indices]
-                coarse_values = outputs_coarse[key]
-                
-                # 计算相对差异
-                relative_diff = jnp.abs(fine_values - coarse_values) / (
-                    jnp.abs(coarse_values) + 1e-6
-                )
-                consistency_loss += jnp.mean(relative_diff**2)
-                
-        return consistency_loss
-        
-    def _cross_scale_coupling_loss(self, 
-                                  params: Dict,
-                                  batch: Dict[str, jnp.ndarray],
-                                  apply_fn: Callable) -> float:
+        return convergence_info
+    
+    def validate(self, data_loader) -> Dict[str, float]:
         """
-        跨尺度耦合损失
+        验证模型
         
-        确保不同尺度的物理过程正确耦合
-        """
-        # 简化的跨尺度耦合：大尺度趋势应该与小尺度平均一致
-        
-        def model_outputs(x, y, t):
-            inputs = {'x': x, 'y': y, 't': t}
-            return apply_fn(params, inputs)
+        Args:
+            data_loader: 验证数据加载器
             
-        outputs = jax.vmap(model_outputs)(batch['x'], batch['y'], batch['t'])
-        
-        # 计算局部平均（模拟大尺度）
-        window_size = min(10, len(batch['x']) // 4)
-        
-        if window_size < 2:
-            return 0.0
-            
-        # 滑动窗口平均
-        def moving_average(values, window):
-            if len(values) < window:
-                return values
-            padded = jnp.pad(values, (window//2, window//2), mode='edge')
-            return jnp.convolve(padded, jnp.ones(window)/window, mode='valid')
-            
-        coupling_loss = 0.0
-        
-        for key in outputs:
-            values = outputs[key]
-            averaged_values = moving_average(values, window_size)
-            
-            # 跨尺度一致性
-            if len(averaged_values) == len(values):
-                scale_coupling = jnp.mean((values - averaged_values)**2)
-                coupling_loss += scale_coupling
-                
-        return coupling_loss
-        
-    def _compute_multiscale_data_loss(self, 
-                                     predictions: Dict[str, jnp.ndarray],
-                                     observations: Dict[str, jnp.ndarray],
-                                     batch: Dict[str, jnp.ndarray]) -> float:
+        Returns:
+            Dict: 验证指标
         """
-        计算多尺度数据损失
-        """
-        data_loss = 0.0
+        self.model.eval()
         
-        # 根据数据的空间分辨率调整权重
-        if 'spatial_resolution' in batch:
-            resolution = batch['spatial_resolution']
-            # 高分辨率数据权重更高
-            resolution_weight = 1.0 / (resolution + 1e-6)
-        else:
-            resolution_weight = 1.0
-            
-        for key in observations:
-            if key in predictions:
-                pred = predictions[key]
-                obs = observations[key]
-                
-                # 多尺度加权
-                mse = jnp.mean((pred - obs)**2)
-                data_loss += resolution_weight * mse
-                
-        return data_loss
+        val_objectives = {obj.name: 0.0 for obj in self.objectives}
+        val_constraints = {const.name: 0.0 for const in self.constraints}
+        val_total_loss = 0.0
+        num_batches = 0
         
-    def _update_scale_weights(self, loss_info: Dict[str, float]):
-        """
-        更新尺度权重
-        """
-        # 简化的自适应权重更新
-        adaptation_rate = self.multiscale_config.get('weight_adaptation_rate', 0.01)
-        
-        # 如果某个尺度的损失较高，增加其权重
-        for key in self.scale_weights:
-            if f'{key}_loss' in loss_info:
-                loss_value = loss_info[f'{key}_loss']
-                if loss_value > 1e-3:  # 阈值
-                    self.scale_weights[key] *= (1 + adaptation_rate)
+        with torch.no_grad():
+            for batch_data in data_loader:
+                if len(batch_data) == 2:
+                    inputs, targets = batch_data
+                    kwargs = {}
                 else:
-                    self.scale_weights[key] *= (1 - adaptation_rate * 0.5)
-                    
-                # 限制权重范围
-                self.scale_weights[key] = jnp.clip(
-                    self.scale_weights[key], 0.1, 5.0
+                    inputs, targets = batch_data[0], batch_data[1]
+                    kwargs = batch_data[2] if len(batch_data) > 2 else {}
+                
+                predictions = self.model(inputs)
+                
+                # 计算损失（不更新权重）
+                total_loss, objective_values, constraint_violations = self.compute_total_loss(
+                    predictions, targets, 0, **kwargs  # iteration=0 for validation
                 )
+                
+                val_total_loss += total_loss.item()
+                for name, value in objective_values.items():
+                    val_objectives[name] += value
+                for name, value in constraint_violations.items():
+                    val_constraints[name] += value
+                
+                num_batches += 1
+        
+        return {
+            'val_total_loss': val_total_loss / num_batches,
+            'val_objectives': {name: value / num_batches for name, value in val_objectives.items()},
+            'val_constraints': {name: value / num_batches for name, value in val_constraints.items()}
+        }
+    
+    def optimize_pareto(self, data_loader, num_generations: int = 100) -> List[Dict[str, Any]]:
+        """
+        执行帕累托优化
+        
+        Args:
+            data_loader: 数据加载器
+            num_generations: 代数
+            
+        Returns:
+            List: 帕累托前沿解集
+        """
+        if self.config.optimization_type != OptimizationType.PARETO:
+            raise ValueError("Pareto optimization requires PARETO optimization type")
+        
+        return self.pareto_optimizer.optimize(self.model, data_loader, num_generations)
+    
+    def get_optimization_summary(self) -> Dict[str, Any]:
+        """
+        获取优化总结
+        
+        Returns:
+            Dict: 优化总结
+        """
+        if not self.training_history:
+            return {'status': 'no_training_data'}
+        
+        latest_metrics = self.training_history[-1]
+        
+        summary = {
+            'optimization_type': self.config.optimization_type.value,
+            'total_epochs': len(self.training_history),
+            'final_loss': latest_metrics['total_loss'],
+            'final_objectives': latest_metrics['objectives'],
+            'final_constraints': latest_metrics['constraints'],
+            'convergence_status': latest_metrics.get('convergence', {}),
+            'objective_weights': self.weight_manager.objective_weights,
+            'constraint_weights': self.weight_manager.constraint_weights
+        }
+        
+        # 计算改进统计
+        if len(self.training_history) > 1:
+            initial_loss = self.training_history[0]['total_loss']
+            final_loss = latest_metrics['total_loss']
+            improvement = (initial_loss - final_loss) / (initial_loss + 1e-10)
+            summary['loss_improvement'] = improvement
+        
+        return summary
 
-def create_coupled_optimization_stage(stage_type: str,
-                                     model: nn.Module,
-                                     optimizer_config: Dict[str, Any],
-                                     physics_config: Dict[str, Any],
-                                     coupling_config: Dict[str, Any],
-                                     **kwargs) -> CoupledOptimizationStage:
+def create_coupled_optimization_trainer(
+    model: nn.Module,
+    objective_types: List[str] = None,
+    constraint_types: List[str] = None,
+    config: CoupledOptimizationConfig = None
+) -> CoupledOptimizationTrainer:
     """
-    工厂函数：创建耦合优化阶段
+    创建耦合优化训练器
     
     Args:
-        stage_type: 耦合优化类型 ('multiphysics', 'multiscale')
-        model: PINNs模型
-        optimizer_config: 优化器配置
-        physics_config: 物理约束配置
-        coupling_config: 耦合配置
-        **kwargs: 额外参数
+        model: 模型
+        objective_types: 目标类型列表
+        constraint_types: 约束类型列表
+        config: 配置
         
     Returns:
-        耦合优化阶段实例
+        CoupledOptimizationTrainer: 训练器实例
     """
-    if stage_type == 'multiphysics':
-        return MultiPhysicsCoupledOptimization(
-            model, optimizer_config, physics_config, coupling_config
-        )
-    elif stage_type == 'multiscale':
-        return MultiscaleCoupledOptimization(
-            model, optimizer_config, physics_config, coupling_config, **kwargs
-        )
-    else:
-        raise ValueError(f"Unknown coupled optimization stage type: {stage_type}")
+    if objective_types is None:
+        objective_types = ['physics', 'data', 'boundary', 'regularization']
+    
+    if constraint_types is None:
+        constraint_types = ['equality', 'inequality']
+    
+    if config is None:
+        config = CoupledOptimizationConfig()
+    
+    # 创建目标函数
+    objectives = []
+    for obj_type in objective_types:
+        if obj_type == 'physics':
+            objectives.append(PhysicsObjective('physics_loss'))
+        elif obj_type == 'data':
+            objectives.append(DataObjective('data_loss'))
+        elif obj_type == 'boundary':
+            objectives.append(BoundaryObjective('boundary_loss'))
+        elif obj_type == 'regularization':
+            objectives.append(RegularizationObjective('regularization_loss'))
+    
+    # 创建约束函数
+    constraints = []
+    for const_type in constraint_types:
+        if const_type == 'equality':
+            constraints.append(EqualityConstraint('mass_conservation'))
+        elif const_type == 'inequality':
+            constraints.append(InequalityConstraint('physical_bounds', upper_bound=1.0, lower_bound=0.0))
+    
+    # 创建训练器
+    trainer = CoupledOptimizationTrainer(model, objectives, constraints, config)
+    
+    return trainer
 
 if __name__ == "__main__":
-    # 测试代码
-    print("Coupled optimization stage module loaded successfully")
+    # 测试耦合优化
     
-    # 配置示例
-    optimizer_config = {
-        'coupled_learning_rate': 1e-4,
-        'multiscale_learning_rate': 5e-5,
-        'max_grad_norm': 1.0,
-        'weight_decay': 1e-5
-    }
+    # 创建简单模型
+    class SimpleModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.Sequential(
+                nn.Linear(3, 32),
+                nn.ReLU(),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+                nn.Linear(16, 3)
+            )
+        
+        def forward(self, x):
+            return self.layers(x)
     
-    physics_config = {
-        'coupling_weight': 1.0,
-        'consistency_weight': 0.5,
-        'multiscale_weight': 1.0,
-        'cross_scale_weight': 0.3,
-        'data_weight': 0.1
-    }
+    model = SimpleModel()
     
-    coupling_config = {
-        'total_steps': 5000,
-        'convergence_window': 50,
-        'convergence_threshold': 1e-6
-    }
+    # 创建配置
+    config = CoupledOptimizationConfig(
+        optimization_type=OptimizationType.WEIGHTED_SUM,
+        max_iterations=100,
+        tolerance=1e-4,
+        adaptive_weights=True
+    )
     
-    multiscale_config = {
-        'spatial_scales': [1.0, 10.0, 100.0],
-        'temporal_scales': [0.1, 1.0, 10.0],
-        'weight_adaptation_rate': 0.01
-    }
+    # 创建训练器
+    trainer = create_coupled_optimization_trainer(
+        model=model,
+        objective_types=['physics', 'data', 'regularization'],
+        constraint_types=['equality', 'inequality'],
+        config=config
+    )
     
-    print("Configuration loaded:")
-    print(f"Optimizer config: {optimizer_config}")
-    print(f"Physics config: {physics_config}")
-    print(f"Coupling config: {coupling_config}")
-    print(f"Multiscale config: {multiscale_config}")
+    # 设置优化器
+    trainer.setup_optimizer(learning_rate=1e-3)
+    
+    # 生成测试数据
+    def generate_test_data(batch_size=32, num_batches=10):
+        for _ in range(num_batches):
+            inputs = torch.randn(batch_size, 3)
+            targets = torch.sin(inputs.sum(dim=1, keepdim=True)).repeat(1, 3)
+            
+            # 添加物理约束信息
+            kwargs = {
+                'physics_residual': torch.randn(batch_size, 3) * 0.1,
+                'boundary_residual': torch.randn(batch_size, 3) * 0.05,
+                'constraint_value': torch.sigmoid(inputs)  # 确保在[0,1]范围内
+            }
+            
+            yield inputs, targets, kwargs
+    
+    # 训练几个epoch
+    print("=== 耦合优化训练测试 ===")
+    
+    for epoch in range(5):
+        data_loader = generate_test_data()
+        metrics = trainer.train_epoch(data_loader, epoch)
+        
+        print(f"\nEpoch {epoch}:")
+        print(f"  总损失: {metrics['total_loss']:.6f}")
+        print(f"  目标函数: {metrics['objectives']}")
+        print(f"  约束违反: {metrics['constraints']}")
+        
+        convergence = metrics['convergence']
+        print(f"  收敛状态: {convergence['converged']}")
+        if convergence['converged']:
+            print("  优化已收敛！")
+            break
+    
+    # 获取优化总结
+    summary = trainer.get_optimization_summary()
+    print(f"\n=== 优化总结 ===")
+    print(f"优化类型: {summary['optimization_type']}")
+    print(f"总训练轮数: {summary['total_epochs']}")
+    print(f"最终损失: {summary['final_loss']:.6f}")
+    print(f"损失改进: {summary.get('loss_improvement', 0):.2%}")
+    print(f"收敛状态: {summary['convergence_status']}")
+    
+    print("\n耦合优化训练测试完成！")
